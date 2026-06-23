@@ -1,10 +1,40 @@
 /* 
 
-Modular simulation,
-set NUM_UE, SIM_DURATION_S, ISD_M, GNB_HEIGHT_M, SAMPLE_INTERVAL_S and
-COVERAGE_TPUT_THRESHOLD_MBPS for a simulation
-select scenario to simulate (Edge, Urban, Rural)
-also log file output path
+Modular simulation for static antenna tilt analysis,
+3 gNBs in equilateral triangle topology (facing origin)
+
+Parameters:
+- NUM_GNB: Fixed at 3 (equilateral triangle)
+- gnb0TiltDeg: Electrical tilt for gNB 0 (degrees)
+- gnb1TiltDeg: Electrical tilt for gNB 1 (degrees)
+- gnb2TiltDeg: Electrical tilt for gNB 2 (degrees)
+- scenario: Edge, Urban, Rural (presets with 50 UEs each)
+- isdM: Inter-site distance (meters)
+- gnbHeightM: gNB antenna height (meters)
+- simDuration: Simulation duration (seconds)
+- sampleIntervalS: Metric sampling interval (seconds)
+- coverageTputThresholdMbps: Coverage threshold (Mbps)
+
+Output:
+- ret_summary.csv: Time-series summary metrics
+- ret_per_ue.csv: Per-UE time-series metrics
+- ue_positions.csv: UE positions and serving gNB
+- log.txt: Configuration log
+
+Running in Optimized build profile of ns3 strips out all NS_LOG and NS_ASSERT
+running in Release build profile still keeps NS_ASSERT checks
+
+Usage Examples:
+  # Uniform tilt (all gNBs same)
+  ./run.sh ret-modular -- --gnb0TiltDeg=7 --gnb1TiltDeg=7 --gnb2TiltDeg=7
+  
+  # Different tilts per gNB
+  ./run.sh ret-modular -- --gnb0TiltDeg=10 --gnb1TiltDeg=3 --gnb2TiltDeg=11
+  
+  # For 15-simulation sweep (uniform tilts 0-14)
+  for t in {0..14}; do
+    ./run.sh ret-modular -- --gnb0TiltDeg=$t --gnb1TiltDeg=$t --gnb2TiltDeg=$t --runName=tilt_$t
+  done
 
 */
 
@@ -33,21 +63,26 @@ using namespace ns3;
 NS_LOG_COMPONENT_DEFINE("NrRetSimulation");
 
 // ── Simulation parameters ─────────────────────────────────────────────────────
-static constexpr uint32_t NUM_GNB                       = 5;  // Fixed, cannot be changed via CLI
+static constexpr uint32_t NUM_GNB                       = 3;  // Fixed: 3 gNBs in equilateral triangle
 
 // Runtime-configurable global parameters (defaults below, can be overridden via CLI)
-static uint32_t g_numUE                        = 10;
+static uint32_t g_numUE                        = 50;
 static double   g_simDuration                  = 40.0;
 static double   g_isdM                         = 500.0;
 static double   g_gnbHeightM                   = 25.0;
 static double   g_sampleIntervalS              = 1.0;
 static double   g_coverageTputThresholdMbps    = 0.5;  // coverage gate
 
+// Static electrical tilt (degrees) - per-gNB individual values
+static double   g_gnb0TiltDeg                  = 7.0;
+static double   g_gnb1TiltDeg                  = 7.0;
+static double   g_gnb2TiltDeg                  = 7.0;
+
 // UE placement bounds (defaults: ±350m square)
-static double   g_ueBoundsXMin                 = -350.0;
-static double   g_ueBoundsXMax                 = 350.0;
-static double   g_ueBoundsYMin                 = -350.0;
-static double   g_ueBoundsYMax                 = 350.0;
+static double   g_ueBoundsXMin                 = -150.0;
+static double   g_ueBoundsXMax                 = 150.0;
+static double   g_ueBoundsYMin                 = -150.0;
+static double   g_ueBoundsYMax                 = 150.0;
 
 // Ring placement parameters (for Edge scenario - cell-edge UEs)
 static double   g_ueRingInnerRadiusM           = 120.0;  // Inner boundary of ring around gNB
@@ -61,23 +96,17 @@ static std::string   g_outputSubdir = "";       // Generated subdir with timesta
 static std::string   g_csvSummaryFileName = ""; // Full path to summary CSV
 static std::string   g_csvPerUeFileName = "";   // Full path to per-UE CSV
 static std::string   g_uePositionsFileName = "";// Full path to UE positions CSV
+static std::string   g_logFileName = "";        // Full path to configuration log
+static std::ofstream g_logFile;                 // Log file stream
 
 // Scenario preset: "custom", "Edge", "Urban", "Rural"
 std::string g_scenario = "custom";
-// Per-gNB initial electrical downtilt (degrees)
-static const std::array<double, NUM_GNB> INITIAL_TILT_DEG = {4.0, 6.0, 5.0, 7.0, 3.0};
 
-// Per-gNB sector bearing (degrees)
-static const std::array<double, NUM_GNB> BEARING_DEG = {180.0, 252.0, 324.0, 36.0, 108.0};
-
-// Per-gNB independent RET schedule: { time_s, new_electrical_tilt_deg }
-static const std::array<std::vector<std::pair<double, double>>, NUM_GNB> RET_SCHEDULE = {{
-    /* gNB 0 */ {{ 8.0, 10.0}, {20.0,  5.0}, {32.0, 12.0}},
-    /* gNB 1 */ {{ 5.0,  2.0}, {15.0,  8.0}, {28.0,  4.0}},
-    /* gNB 2 */ {{10.0, 14.0}, {22.0,  6.0}},
-    /* gNB 3 */ {{ 6.0,  9.0}, {18.0,  3.0}, {30.0, 11.0}},
-    /* gNB 4 */ {{12.0,  7.0}, {25.0, 13.0}},
-}};
+// Per-gNB sector bearing (degrees) - facing toward origin
+// gNB 0 at 90° position, faces 270° (down)
+// gNB 1 at 210° position, faces 30° (up-right)
+// gNB 2 at 330° position, faces 150° (up-left)
+static const std::array<double, NUM_GNB> BEARING_DEG = {270.0, 30.0, 150.0};
 
 // ── Global state ──────────────────────────────────────────────────────────────
 std::vector<Ptr<UniformPlanarArray>> g_gnbAntennas(NUM_GNB, nullptr);
@@ -120,13 +149,14 @@ void RsrpCallback(uint32_t ueIdx,
     g_latestRsrp_dBm[ueIdx] = rsrp_dBm;
 }
 
-// ── Metric sampling ───────────────────────────────────────────────────────────
 void SampleMetrics()
 {
     double now = Simulator::Now().GetSeconds();
 
-    // ── Per-UE throughput ────────────────────────────────────────────────────
+    // ── Per-UE throughput calculation ────────────────────────────────────────
     std::vector<double> tput(g_numUE, 0.0);
+    std::vector<double> activeTputs; // Keep track of metrics ONLY for running apps
+
     for (uint32_t u = 0; u < g_numUE; ++u)
     {
         if (!g_sinks[u]) continue;
@@ -134,29 +164,46 @@ void SampleMetrics()
         uint64_t delta   = bytes - g_prevBytes[u];
         g_prevBytes[u]   = bytes;
         tput[u]          = static_cast<double>(delta) * 8.0 / (g_sampleIntervalS * 1e6); // Mbps
+
+        // STRATEGY FIX: Only include UE in network health KPIs if it has actually turned on.
+        // If total accumulated bytes are still zero, it means it is stuck in the stagger window delay.
+        if (bytes > 0)
+        {
+            activeTputs.push_back(tput[u]);
+        }
     }
 
-    // ── Aggregate metrics ────────────────────────────────────────────────────
-    double sumT  = std::accumulate(tput.begin(), tput.end(), 0.0);
-    double sumT2 = std::inner_product(tput.begin(), tput.end(), tput.begin(), 0.0);
-    double avgT  = sumT / g_numUE;
+    // Fallback if the simulation starts completely silent (no UEs are alive yet)
+    uint32_t activeUeCount = activeTputs.size();
+    if (activeUeCount == 0)
+    {
+        // Schedule next sample and escape without writing a polluted macro row
+        if (now + g_sampleIntervalS < g_simDuration)
+            Simulator::Schedule(Seconds(g_sampleIntervalS), &SampleMetrics);
+        return;
+    }
 
-    // JFI = (Σx)² / (n·Σx²)  — 1.0 = perfectly fair, 1/n = worst case
-    double jfi = (sumT2 > 0.0) ? (sumT * sumT) / (g_numUE * sumT2) : 1.0;
+    // ── Aggregate metrics over the ACTIVE population ──────────────────────────
+    double sumT  = std::accumulate(activeTputs.begin(), activeTputs.end(), 0.0);
+    double sumT2 = std::inner_product(activeTputs.begin(), activeTputs.end(), activeTputs.begin(), 0.0);
+    double avgT  = sumT / activeUeCount;
 
-    // Coverage: fraction of UEs above threshold
+    // JFI calculated dynamically based only on active, running users
+    double jfi = (sumT2 > 0.0) ? (sumT * sumT) / (activeUeCount * sumT2) : 1.0;
+
+    // Coverage: Evaluated strictly among active nodes
     uint32_t covered = 0;
-    for (double t : tput) if (t >= g_coverageTputThresholdMbps) ++covered;
-    double coveragePct = 100.0 * covered / g_numUE;
+    for (double t : activeTputs) if (t >= g_coverageTputThresholdMbps) ++covered;
+    double coveragePct = 100.0 * covered / activeUeCount;
 
-    // 5th-percentile throughput (edge UE proxy)
-    std::vector<double> sorted = tput;
+    // 5th-percentile sorting over active users
+    std::vector<double> sorted = activeTputs;
     std::sort(sorted.begin(), sorted.end());
-    double p5  = sorted[std::max(0, static_cast<int>(0.05 * g_numUE + 0.5) - 1)];
+    double p5  = sorted[std::max(0, static_cast<int>(0.05 * activeUeCount + 0.5) - 1)];
     double minT = sorted.front();
     double maxT = sorted.back();
 
-    // ── Current tilt snapshot ─────────────────────────────────────────────────
+    // ── Current tilt snapshot parsing ─────────────────────────────────────────
     std::string tiltSnap;
     for (uint32_t i = 0; i < NUM_GNB; ++i)
     {
@@ -177,7 +224,7 @@ void SampleMetrics()
         g_csvSummary << "," << g_currentTiltDeg[i];
     g_csvSummary << "\n";
 
-    // ── Write per-UE CSV rows ─────────────────────────────────────────────────
+    // ── Write per-UE CSV rows (Kept complete to track timeline continuity) ─────
     for (uint32_t u = 0; u < g_numUE; ++u)
     {
         g_csvPerUe << now
@@ -200,11 +247,12 @@ void SampleMetrics()
                 << "  coverage="  << std::setprecision(0) << coveragePct << "%"
                 << "  tilts=["    << tiltSnap << "]");
 
-    // Schedule next sample (stop before simulation end to avoid overshoot)
+    // Schedule next sample loop iteration
     if (now + g_sampleIntervalS < g_simDuration)
         Simulator::Schedule(Seconds(g_sampleIntervalS), &SampleMetrics);
 }
-
+        
+                   
 // ── RET actuator — true electrical tilt via beamforming vector ───────────────
 void ApplyRet(uint32_t gnbIdx, double newTiltDeg)
 {
@@ -251,19 +299,25 @@ void HarvestAntennaHandles(const NetDeviceContainer& gnbDevs,
 
 }
 
-// ── Pentagon gNB placement ────────────────────────────────────────────────────
+// ── Equilateral triangle gNB placement (facing origin) ───────────────────────
 void PlaceGnbs(NodeContainer& gnbs)
 {
-    const double radius = g_isdM / (2.0 * std::sin(M_PI / NUM_GNB));
+    // For equilateral triangle: radius = ISD / sqrt(3)
+    const double radius = g_isdM / std::sqrt(3.0);
+    
+    // Place 3 gNBs at 90°, 210°, 330° positions (on circle around origin)
+    // gNB 0 at top (90°), gNB 1 at bottom-left (210°), gNB 2 at bottom-right (330°)
+    const std::array<double, NUM_GNB> positionAngles = {90.0, 210.0, 330.0};
+    
     for (uint32_t i = 0; i < NUM_GNB; ++i)
     {
-        double angle = (2.0 * M_PI / NUM_GNB) * i - M_PI / 2.0;
+        double angleRad = DegreesToRadians(positionAngles[i]);
         gnbs.Get(i)->GetObject<MobilityModel>()->SetPosition(
-            Vector(radius * std::cos(angle),
-                   radius * std::sin(angle),
+            Vector(radius * std::cos(angleRad),
+                   radius * std::sin(angleRad),
                    g_gnbHeightM));
     }
-    NS_LOG_INFO("[gNB] Placed "<<NUM_GNB<<" gNBs in N-gon");
+    NS_LOG_INFO("[gNB] Placed "<<NUM_GNB<<" gNBs in equilateral triangle (radius=" << radius << "m, ISD=" << g_isdM << "m)");
 }
 
 // ── Ring-based UE placement for cell-edge testing ─────────────────────────────
@@ -305,12 +359,15 @@ void PlaceUesInRings(NodeContainer& ues, const NodeContainer& gnbs)
 int main(int argc, char* argv[])
 {
     // Set default values for global parameters
-    g_numUE                        = 10;
-    g_simDuration                  = 40.0;
+    g_numUE                        = 50;
+    g_simDuration                  = 20.0;
     g_isdM                         = 500.0;
     g_gnbHeightM                   = 25.0;
     g_sampleIntervalS              = 1.0;
     g_coverageTputThresholdMbps    = 0.5;
+    g_gnb0TiltDeg                  = 7.0;
+    g_gnb1TiltDeg                  = 7.0;
+    g_gnb2TiltDeg                  = 7.0;
 
     CommandLine cmd(__FILE__);
     cmd.AddValue("numUE", "Number of UEs", g_numUE);
@@ -319,6 +376,11 @@ int main(int argc, char* argv[])
     cmd.AddValue("gnbHeightM", "gNB height (m)", g_gnbHeightM);
     cmd.AddValue("sampleIntervalS", "Sample interval (s)", g_sampleIntervalS);
     cmd.AddValue("coverageTputThresholdMbps", "Coverage threshold (Mbps)", g_coverageTputThresholdMbps);
+    
+    // Static tilt configuration - per-gNB individual values
+    cmd.AddValue("gnb0TiltDeg", "Electrical tilt for gNB 0 (degrees)", g_gnb0TiltDeg);
+    cmd.AddValue("gnb1TiltDeg", "Electrical tilt for gNB 1 (degrees)", g_gnb1TiltDeg);
+    cmd.AddValue("gnb2TiltDeg", "Electrical tilt for gNB 2 (degrees)", g_gnb2TiltDeg);
 
     // Output directory configuration
     cmd.AddValue("runName", "Run name for output directory", g_runName);
@@ -338,8 +400,17 @@ int main(int argc, char* argv[])
     LogComponentEnable("NrRetSimulation", LOG_LEVEL_INFO);
     // Config::SetDefault("ns3::NrQosFlowToRlcMapping", EnumValue(ns3::NrGnbRrc::RLC_UM_ALWAYS));
     // Config::SetDefault(ns3::ThreeGppChannelConditionModel::m_updatePeriod)
-    
-    
+    // 2. Slow down channel matrix updates to match static tilt optimization
+    // Config::SetDefault("ns3::MatrixBasedChannelModel::UpdatePeriod", TimeValue(MilliSeconds(100)));
+
+    // // 3. Cache fading traces to prevent continuous recalculations
+    // Config::SetDefault("ns3::MatrixBasedChannelModel::FadingTraceSamples", UintegerValue(1000));
+
+    // // 4. Expand internal RLC and Socket buffers so that 90 Mbps/UE traffic doesn't drop
+    // Config::SetDefault("ns3::NrRlcUm::MaxTxBufferSize", UintegerValue(10 * 1024 * 1024));
+    // Config::SetDefault("ns3::UdpSocketFactory::RcvBufSize", UintegerValue(20000000));
+    // Config::SetDefault("ns3::UdpSocketFactory::SndBufSize", UintegerValue(20000000));
+        
     // Generate timestamped output subdirectory
     std::time_t now = std::time(nullptr);
     char timestamp[64];
@@ -353,44 +424,110 @@ int main(int argc, char* argv[])
     g_csvSummaryFileName = g_outputSubdir + "/ret_summary.csv";
     g_csvPerUeFileName = g_outputSubdir + "/ret_per_ue.csv";
     g_uePositionsFileName = g_outputSubdir + "/ue_positions.csv";
+    g_logFileName = g_outputSubdir + "/log.txt";
+    
+    // Open log file
+    g_logFile.open(g_logFileName);
+    g_logFile << "========================================\n";
+    g_logFile << "   Simulation Configuration Log\n";
+    g_logFile << "========================================\n\n";
+    g_logFile << "Timestamp: " << timestamp << "\n\n";
+    
+    // Write simulation parameters
+    g_logFile << "--- Simulation Parameters ---\n";
+    g_logFile << "Scenario: " << g_scenario << "\n";
+    g_logFile << "NUM_GNB: " << NUM_GNB << " (equilateral triangle)\n";
+    g_logFile << "numUE: " << g_numUE << "\n";
+    g_logFile << "simDuration: " << g_simDuration << "s\n";
+    g_logFile << "ISD: " << g_isdM << "m\n";
+    g_logFile << "gNB Height: " << g_gnbHeightM << "m\n";
+    g_logFile << "Static Tilts (per-gNB):\n";
+    g_logFile << "  gNB 0: " << g_gnb0TiltDeg << " degrees\n";
+    g_logFile << "  gNB 1: " << g_gnb1TiltDeg << " degrees\n";
+    g_logFile << "  gNB 2: " << g_gnb2TiltDeg << " degrees\n";
+    g_logFile << "Sample Interval: " << g_sampleIntervalS << "s\n";
+    g_logFile << "Coverage Threshold: " << g_coverageTputThresholdMbps << " Mbps\n\n";
+    
+    // Write gNB configuration
+    g_logFile << "--- gNB Configuration ---\n";
+    const double radius = g_isdM / std::sqrt(3.0);
+    const std::array<double, NUM_GNB> positionAngles = {90.0, 210.0, 330.0};
+    for (uint32_t i = 0; i < NUM_GNB; ++i)
+    {
+        double angleRad = DegreesToRadians(positionAngles[i]);
+        double x = radius * std::cos(angleRad);
+        double y = radius * std::sin(angleRad);
+        g_logFile << "gNB " << i << ": Position=(" << std::fixed << std::setprecision(2) 
+                  << x << ", " << y << ", " << g_gnbHeightM << ")m, "
+                  << "Bearing=" << BEARING_DEG[i] << "deg (facing origin)\n";
+    }
+    g_logFile << "\n";
+    
+    // Write UE configuration
+    g_logFile << "--- UE Configuration ---\n";
+    if (g_ueRingPlacement)
+    {
+        g_logFile << "Placement: Ring (cell-edge)\n";
+        g_logFile << "Ring Inner Radius: " << g_ueRingInnerRadiusM << "m\n";
+        g_logFile << "Ring Outer Radius: " << g_ueRingOuterRadiusM << "m\n";
+    }
+    else
+    {
+        g_logFile << "Placement: Random uniform\n";
+        g_logFile << "X Bounds: [" << g_ueBoundsXMin << ", " << g_ueBoundsXMax << "]m\n";
+        g_logFile << "Y Bounds: [" << g_ueBoundsYMin << ", " << g_ueBoundsYMax << "]m\n";
+    }
+    g_logFile << "\n";
+    
+    // Write output file paths
+    g_logFile << "--- Output Files ---\n";
+    g_logFile << "Summary CSV: " << g_csvSummaryFileName << "\n";
+    g_logFile << "Per-UE CSV: " << g_csvPerUeFileName << "\n";
+    g_logFile << "UE Positions: " << g_uePositionsFileName << "\n";
+    g_logFile << "Log File: " << g_logFileName << "\n\n";
+    
+    g_logFile << "========================================\n";
+    g_logFile << "   Simulation Starting\n";
+    g_logFile << "========================================\n\n";
 
     // Apply scenario preset (overrides command-line values)
     if (g_scenario == "Edge") {
         g_numUE = 50;
         g_isdM = 200.0;
         g_gnbHeightM = 25.0;
-        g_ueBoundsXMin = -250.0; g_ueBoundsXMax = 250.0;  // Cell edge only
-        g_ueBoundsYMin = -250.0; g_ueBoundsYMax = 250.0;
-        g_coverageTputThresholdMbps = 0.2;
+        // g_ueBoundsXMin = -250.0; g_ueBoundsXMax = 250.0;  // Cell edge only, not used for Ring Placement
+        // g_ueBoundsYMin = -250.0; g_ueBoundsYMax = 250.0;
+        g_coverageTputThresholdMbps = 20;
         g_ueRingPlacement = true;  // Enable ring placement for Edge scenario
-        g_ueRingInnerRadiusM = 120.0;  // 70% of gNB radius (170m)
-        g_ueRingOuterRadiusM = 160.0;  // 94% of gNB radius
+        g_ueRingInnerRadiusM = 70;  // 70% of gNB radius (170m)
+        g_ueRingOuterRadiusM = 110.0;  // 94% of gNB radius
     } else if (g_scenario == "Urban") {
-        g_numUE = 100;
+        g_numUE = 50;
         g_isdM = 500.0;
         g_gnbHeightM = 30.0;
-        g_ueBoundsXMin = -500.0; g_ueBoundsXMax = 500.0;  // Full coverage
-        g_ueBoundsYMin = -500.0; g_ueBoundsYMax = 500.0;
-        g_coverageTputThresholdMbps = 0.3;
+        g_ueBoundsXMin = -150.0; g_ueBoundsXMax = 150.0;  // Full coverage
+        g_ueBoundsYMin = -150.0; g_ueBoundsYMax = 150.0;
+        g_coverageTputThresholdMbps = 50;
     } else if (g_scenario == "Rural") {
-        g_numUE = 25;
-        g_isdM = 1000.0;
+        g_numUE = 50;
+        g_isdM = 1500.0; // distance from Origin of the gNB is ISD/sqrt(3)
         g_gnbHeightM = 40.0;
-        g_ueBoundsXMin = -800.0; g_ueBoundsXMax = 800.0;  // Wide area
-        g_ueBoundsYMin = -800.0; g_ueBoundsYMax = 800.0;
-        g_coverageTputThresholdMbps = 0.1;
+        g_ueBoundsXMin = -650.0; g_ueBoundsXMax = 650.0;  // Wide area
+        g_ueBoundsYMin = -650.0; g_ueBoundsYMax = 650.0;
+        g_coverageTputThresholdMbps = 10;
     }
     // else "custom" - use CLI values
 
     // Initialize UE state vectors based on command-line specified numUE
-    g_sinks.resize(g_numUE, nullptr);
+    g_sinks.resize(g_numUE);
     g_prevBytes.resize(g_numUE, 0);
     g_latestSinr_dB.resize(g_numUE, 0.0);
     g_latestRsrp_dBm.resize(g_numUE, -140.0);
 
-    // Initialise current-tilt tracker
-    for (uint32_t i = 0; i < NUM_GNB; ++i)
-        g_currentTiltDeg[i] = INITIAL_TILT_DEG[i];
+    // Initialise current-tilt tracker with per-gNB tilt values
+    g_currentTiltDeg[0] = g_gnb0TiltDeg;
+    g_currentTiltDeg[1] = g_gnb1TiltDeg;
+    g_currentTiltDeg[2] = g_gnb2TiltDeg;
 
     // ── Open CSV files ────────────────────────────────────────────────────────
     g_csvSummary.open(g_csvSummaryFileName);
@@ -463,13 +600,13 @@ int main(int argc, char* argv[])
 
     // ── Band / BWP ────────────────────────────────────────────────────────────
     CcBwpCreator ccBwpCreator;
-    CcBwpCreator::SimpleOperationBandConf bandConf(3.5e9, 20e6, 1);
+    CcBwpCreator::SimpleOperationBandConf bandConf(3.5e9, 100e6, 1);
     OperationBandInfo band = ccBwpCreator.CreateOperationBandContiguousCc(bandConf);
     channelHelper->AssignChannelsToBands({band});
     BandwidthPartInfoPtrVector allBwps = CcBwpCreator::GetAllBwps({band});
 
     // ── Scheduler ─────────────────────────────────────────────────────────────
-    nrHelper->SetSchedulerTypeId(NrMacSchedulerTdmaRR::GetTypeId());
+    nrHelper->SetSchedulerTypeId(NrMacSchedulerOfdmaPF::GetTypeId());
 
     // ── Antenna config ────────────────────────────────────────────────────────
     nrHelper->SetGnbAntennaAttribute("NumRows",    UintegerValue(4));
@@ -579,8 +716,8 @@ int main(int argc, char* argv[])
 
     Ptr<UniformRandomVariable> RV = CreateObject<UniformRandomVariable>();
     RV->SetAttribute("Min", DoubleValue(1.0));
-    RV->SetAttribute("Max", DoubleValue(5.0));
-
+    RV->SetAttribute("Max", DoubleValue(2.0));
+        // ns3::MatrixBasedChannelModel
     for (uint32_t u = 0; u < g_numUE; ++u)
     {
         UdpClientHelper dlClient(ueIpIfaces.GetAddress(u), dlPort);
@@ -622,26 +759,21 @@ int main(int argc, char* argv[])
             MakeBoundCallback(&RsrpCallback, u));
     }
 
-    // ── Initial electrical tilts at t=1ms (after BF run at t=0) ─────────────
-    NS_LOG_INFO("=== Initial Electrical Tilt ===");
+    // ── Apply static electrical tilt at t=1ms (after BF run at t=0) ─────────
+    NS_LOG_INFO("=== Static Electrical Tilt ===");
+    const std::array<double, NUM_GNB> tilts = {g_gnb0TiltDeg, g_gnb1TiltDeg, g_gnb2TiltDeg};
     for (uint32_t i = 0; i < NUM_GNB; ++i)
     {
-        Simulator::Schedule(MilliSeconds(1), &ApplyRet, i, INITIAL_TILT_DEG[i]);
+        Simulator::Schedule(MilliSeconds(1), &ApplyRet, i, tilts[i]);
         NS_LOG_INFO("  gNB[" << i << "]"
                     << "  bearing="    << BEARING_DEG[i]      << "deg"
-                    << "  elec_tilt="  << INITIAL_TILT_DEG[i] << "deg");
+                    << "  elec_tilt="  << tilts[i]            << "deg");
     }
-
-    // ── RET schedule ──────────────────────────────────────────────────────────
-    NS_LOG_INFO("=== RET Event Schedule ===");
-    for (uint32_t i = 0; i < NUM_GNB; ++i)
-        for (const auto& [t, tilt] : RET_SCHEDULE[i])
-        {
-            Simulator::Schedule(Seconds(t), &ApplyRet, i, tilt);
-            NS_LOG_INFO("  gNB[" << i << "]  t=" << t << "s  tilt=" << tilt << "deg");
-        }
-    // ── Start metric sampling at t=5.5s Staggered Traffic times ────────────
-    Simulator::Schedule(Seconds(5.5), &SampleMetrics);
+    NS_LOG_INFO("  All gNBs configured with static tilts: [" 
+                << tilts[0] << ", " << tilts[1] << ", " << tilts[2] << "] degrees");
+    
+    // ── Start metric sampling at t=2.5s Staggered Traffic times ────────────
+    Simulator::Schedule(Seconds(2.5), &SampleMetrics);
 
     // ── Enable ns-3/NR built-in traces (RxPacketTrace, etc.) ─────────────────
     // nrHelper->EnableTraces();
@@ -679,6 +811,20 @@ int main(int argc, char* argv[])
     char buf[64];
     std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", std::localtime(&now));
     NS_LOG_INFO("Completed at time " << buf);
+    
+    // Write simulation completion info to log file
+    g_logFile << "\n========================================\n";
+    g_logFile << "   Simulation Completed\n";
+    g_logFile << "========================================\n\n";
+    g_logFile << "Completion Time: " << buf << "\n";
+    g_logFile << "Output Files:\n";
+    g_logFile << "  - " << g_csvSummaryFileName << "\n";
+    g_logFile << "  - " << g_csvPerUeFileName << "\n";
+    g_logFile << "  - " << g_uePositionsFileName << "\n";
+    g_logFile << "\n========================================\n";
+    
+    // Close log file
+    g_logFile.close();
 
     return 0;
 }
