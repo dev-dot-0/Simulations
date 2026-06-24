@@ -407,9 +407,8 @@ int main(int argc, char* argv[])
     // Config::SetDefault("ns3::MatrixBasedChannelModel::FadingTraceSamples", UintegerValue(1000));
 
     // // 4. Expand internal RLC and Socket buffers so that 90 Mbps/UE traffic doesn't drop
-    // Config::SetDefault("ns3::NrRlcUm::MaxTxBufferSize", UintegerValue(10 * 1024 * 1024));
-    // Config::SetDefault("ns3::UdpSocketFactory::RcvBufSize", UintegerValue(20000000));
-    // Config::SetDefault("ns3::UdpSocketFactory::SndBufSize", UintegerValue(20000000));
+    Config::SetDefault("ns3::NrRlcUm::MaxTxBufferSize", UintegerValue(10 * 1024 * 1024));
+    Config::SetDefault("ns3::UdpSocket::RcvBufSize", UintegerValue(20 * 1024 * 1024));
         
     // Generate timestamped output subdirectory
     std::time_t now = std::time(nullptr);
