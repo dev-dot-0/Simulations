@@ -1,0 +1,52 @@
+========================================
+   Simulation Configuration Log
+========================================
+
+Timestamp: 2026-06-25_13-31-23
+
+--- Simulation Parameters ---
+Scenario: Urban
+NUM_GNB: 3 (equilateral triangle)
+numUE: 50
+simDuration: 20s
+ISD: 500m
+gNB Height: 25m
+Static Tilts (per-gNB):
+  gNB 0: 7 degrees
+  gNB 1: 7 degrees
+  gNB 2: 7 degrees
+Sample Interval: 1s
+Coverage Threshold: 0.5 Mbps
+
+--- gNB Configuration ---
+gNB 0: Position=(0.00, 288.68, 25.00)m, Bearing=270.00deg (facing origin)
+gNB 1: Position=(-250.00, -144.34, 25.00)m, Bearing=30.00deg (facing origin)
+gNB 2: Position=(250.00, -144.34, 25.00)m, Bearing=150.00deg (facing origin)
+
+--- UE Configuration ---
+Placement: Random uniform
+X Bounds: [-150.00, 150.00]m
+Y Bounds: [-150.00, 150.00]m
+
+--- Output Files ---
+Summary CSV: /home/srikar/Desktop/Simulations/simulations/run_2026-06-25_13-31-23/ret_summary.csv
+Per-UE CSV: /home/srikar/Desktop/Simulations/simulations/run_2026-06-25_13-31-23/ret_per_ue.csv
+UE Positions: /home/srikar/Desktop/Simulations/simulations/run_2026-06-25_13-31-23/ue_positions.csv
+Log File: /home/srikar/Desktop/Simulations/simulations/run_2026-06-25_13-31-23/log.txt
+
+========================================
+   Simulation Starting
+========================================
+
+
+========================================
+   Simulation Completed
+========================================
+
+Completion Time: 2026-06-25 16:17:30
+Output Files:
+  - /home/srikar/Desktop/Simulations/simulations/run_2026-06-25_13-31-23/ret_summary.csv
+  - /home/srikar/Desktop/Simulations/simulations/run_2026-06-25_13-31-23/ret_per_ue.csv
+  - /home/srikar/Desktop/Simulations/simulations/run_2026-06-25_13-31-23/ue_positions.csv
+
+========================================
