@@ -20,9 +20,9 @@ import requests
 import re
 
 # ── Configuration ─────────────────────────────────────────────────────────────
-API_URL = "https://agent.sec.samsung.net/api/v1/run/4bd4a876-d330-4e88-8e83-cf9029201b51?stream=false"
-API_KEY = os.environ.get("SAMSUNG_API_KEY", "sk-Dprx376aoTr_SEo8HwSnXMPG6wcMs6X8Go4RAebdILs")
-SESSION_ID = "4bd4a876-d330-4e88-8e83-cf9029201b51"
+API_URL = "https://agent/api/v1/run/4bd4a876-d330-4e88-8e83-cf9029201b51?stream=false"
+API_KEY = os.environ.get(".", ".")
+SESSION_ID = "4bd4"
 
 # Observation format: time, total, avg, min, p5, max, jfi, coverage, tilt0, tilt1, tilt2
 NUM_OBS_FEATURES = 11
