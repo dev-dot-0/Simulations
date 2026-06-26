@@ -44,6 +44,7 @@ Usage Examples:
 #include "ns3/internet-module.h"
 #include "ns3/mobility-module.h"
 #include "ns3/network-module.h"
+#include "ns3/beam-manager.h"
 #include "ns3/nr-module.h"
 #include "ns3/point-to-point-module.h"
 
@@ -586,12 +587,14 @@ int main(int argc, char* argv[])
     nrHelper->SetEpcHelper(epcHelper);
 
     Ptr<IdealBeamformingHelper> bfHelper = CreateObject<IdealBeamformingHelper>();
-    nrHelper->SetBeamformingHelper(bfHelper);
-    bfHelper->SetAttribute("BeamformingMethod",
-                           TypeIdValue(DirectPathBeamforming::GetTypeId()));
-    // One-shot beamforming: period >> simDuration so it never re-runs after t=0
+    // IMPORTANT: Set periodicity BEFORE SetBeamformingHelper (which calls Initialize(),
+    // scheduling the timer). If we set it after, the default 100ms timer fires at t=100ms
+    // and re-runs beamforming, overwriting our RET vectors with optimal per-UE vectors.
     bfHelper->SetAttribute("BeamformingPeriodicity",
                            TimeValue(Seconds(g_simDuration + 1000.0)));
+    bfHelper->SetAttribute("BeamformingMethod",
+                           TypeIdValue(DirectPathBeamforming::GetTypeId()));
+    nrHelper->SetBeamformingHelper(bfHelper);
 
     // ── Channel helper ────────────────────────────────────────────────────────
     Ptr<NrChannelHelper> channelHelper = CreateObject<NrChannelHelper>();
@@ -685,6 +688,47 @@ int main(int argc, char* argv[])
     }
     g_uePositions.close();
     NS_LOG_INFO("[INIT] UE positions written to " << g_uePositionsFileName);
+
+    // ── Overwrite per-UE beams with fixed RET beam ─────────────────────────────
+    // The beamforming helper computed per-UE optimal beams during attach.
+    // We replace them all with the fixed RET beam so the tilt takes effect.
+    NS_LOG_INFO("=== Overwriting per-UE beams with fixed RET beam ===");
+    for (uint32_t gnbIdx = 0; gnbIdx < NUM_GNB; ++gnbIdx)
+    {
+        double bearingDeg  = BEARING_DEG[gnbIdx];
+        double tiltDeg     = g_currentTiltDeg[gnbIdx];
+        double zenithDeg   = 90.0 - tiltDeg;
+
+        PhasedArrayModel::ComplexVector retBfv =
+            CreateDirectionalBfvAz(g_gnbAntennas[gnbIdx], bearingDeg, zenithDeg);
+
+        Ptr<NrGnbPhy> phy = nrHelper->GetGnbPhy(gnbDevs.Get(gnbIdx), 0);
+        Ptr<NrSpectrumPhy> specPhy = phy->GetSpectrumPhy();
+        Ptr<BeamManager> beamManager = specPhy->GetBeamManager();
+
+        if (!beamManager)
+        {
+            NS_LOG_WARN("  gNB[" << gnbIdx << "] no BeamManager found");
+            continue;
+        }
+
+        for (uint32_t u = 0; u < g_numUE; ++u)
+        {
+            Ptr<NrUeNetDevice> ueDev = ueDevs.Get(u)->GetObject<NrUeNetDevice>();
+            Ptr<const NrGnbNetDevice> targetGnb = ueDev->GetTargetGnb();
+            Ptr<NrGnbNetDevice> gnbDev = gnbDevs.Get(gnbIdx)->GetObject<NrGnbNetDevice>();
+            if (targetGnb == gnbDev)
+            {
+                BeamformingVector retBfvPair = {retBfv, BeamId(static_cast<uint16_t>(gnbIdx), static_cast<uint16_t>(tiltDeg))};
+                beamManager->SaveBeamformingVector(retBfvPair, ueDev);
+                NS_LOG_INFO("  gNB[" << gnbIdx << "] overwrote UE[" << u << "] beam -> RET "
+                            << "bearing=" << bearingDeg << "deg, tilt=" << tiltDeg << "deg");
+            }
+        }
+
+        g_gnbAntennas[gnbIdx]->SetBeamformingVector(retBfv);
+    }
+    NS_LOG_INFO("=== RET beam overwrite complete ===");
 
     // ── Remote host + routing ──────────────────────────────────────────────────
     NodeContainer remoteHostContainer;
