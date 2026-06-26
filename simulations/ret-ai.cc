@@ -91,6 +91,9 @@ static const std::array<double, NUM_GNB> BEARING_DEG = {270.0, 30.0, 150.0};
 // ── Global state ──────────────────────────────────────────────────────────────
 std::vector<Ptr<UniformPlanarArray>> g_gnbAntennas(NUM_GNB, nullptr);
 std::array<double, NUM_GNB>          g_currentTiltDeg;
+Ptr<NrHelper>                        g_nrHelper;
+NetDeviceContainer                   g_gnbDevs;
+NetDeviceContainer                   g_ueDevs;
 
 // Measurement state per UE
 std::vector<Ptr<PacketSink>> g_sinks;
@@ -159,6 +162,27 @@ void ApplyRet(uint32_t gnbIdx, double newTiltDeg)
         CreateDirectionalBfvAz(g_gnbAntennas[gnbIdx], bearingDeg, zenithDeg);
     g_gnbAntennas[gnbIdx]->SetBeamformingVector(bfv);
     g_currentTiltDeg[gnbIdx] = newTiltDeg;
+
+    // Also update BeamManager per-UE vectors so SendDataChannels uses the RET beam
+    if (g_nrHelper)
+    {
+        Ptr<NrGnbPhy> phy = g_nrHelper->GetGnbPhy(g_gnbDevs.Get(gnbIdx), 0);
+        Ptr<NrSpectrumPhy> specPhy = phy->GetSpectrumPhy();
+        Ptr<BeamManager> beamManager = specPhy->GetBeamManager();
+        if (beamManager)
+        {
+            for (uint32_t u = 0; u < g_ueDevs.GetN(); ++u)
+            {
+                Ptr<NrUeNetDevice> ueDev = g_ueDevs.Get(u)->GetObject<NrUeNetDevice>();
+                Ptr<const NrGnbNetDevice> targetGnb = ueDev->GetTargetGnb();
+                if (targetGnb == g_gnbDevs.Get(gnbIdx))
+                {
+                    BeamformingVector bfvPair = {bfv, BeamId(static_cast<uint16_t>(gnbIdx), static_cast<uint16_t>(newTiltDeg))};
+                    beamManager->SaveBeamformingVector(bfvPair, ueDev);
+                }
+            }
+        }
+    }
 }
 
 // ── Harvest UPA handles + set mechanical bearing ──────────────────────────────
@@ -636,13 +660,14 @@ int main(int argc, char* argv[])
     Ptr<NrHelper>                nrHelper  = CreateObject<NrHelper>();
     Ptr<NrPointToPointEpcHelper> epcHelper = CreateObject<NrPointToPointEpcHelper>();
     nrHelper->SetEpcHelper(epcHelper);
+    g_nrHelper = nrHelper;
 
     Ptr<IdealBeamformingHelper> bfHelper = CreateObject<IdealBeamformingHelper>();
-    nrHelper->SetBeamformingHelper(bfHelper);
-    bfHelper->SetAttribute("BeamformingMethod",
-                           TypeIdValue(DirectPathBeamforming::GetTypeId()));
     bfHelper->SetAttribute("BeamformingPeriodicity",
                            TimeValue(Seconds(g_simDuration + 1000.0)));
+    bfHelper->SetAttribute("BeamformingMethod",
+                           TypeIdValue(DirectPathBeamforming::GetTypeId()));
+    nrHelper->SetBeamformingHelper(bfHelper);
 
     // Channel helper
     Ptr<NrChannelHelper> channelHelper = CreateObject<NrChannelHelper>();
@@ -677,6 +702,8 @@ int main(int argc, char* argv[])
     // Install devices
     NetDeviceContainer gnbDevs = nrHelper->InstallGnbDevice(gnbNodes, allBwps);
     NetDeviceContainer ueDevs  = nrHelper->InstallUeDevice(ueNodes,   allBwps);
+    g_gnbDevs = gnbDevs;
+    g_ueDevs  = ueDevs;
 
     // Harvest UPA handles
     HarvestAntennaHandles(gnbDevs, nrHelper);
@@ -728,6 +755,45 @@ int main(int argc, char* argv[])
         g_uePositions << i << "," << uePos.x << "," << uePos.y << "," << uePos.z << "," << gnbIdx << "\n";
     }
     g_uePositions.close();
+
+    // ── Overwrite per-UE beams with fixed RET beam ─────────────────────────────
+    NS_LOG_INFO("=== Overwriting per-UE beams with fixed RET beam ===");
+    for (uint32_t gnbIdx = 0; gnbIdx < NUM_GNB; ++gnbIdx)
+    {
+        double bearingDeg  = BEARING_DEG[gnbIdx];
+        double tiltDeg     = g_currentTiltDeg[gnbIdx];
+        double zenithDeg   = 90.0 - tiltDeg;
+
+        PhasedArrayModel::ComplexVector retBfv =
+            CreateDirectionalBfvAz(g_gnbAntennas[gnbIdx], bearingDeg, zenithDeg);
+
+        Ptr<NrGnbPhy> phy = nrHelper->GetGnbPhy(gnbDevs.Get(gnbIdx), 0);
+        Ptr<NrSpectrumPhy> specPhy = phy->GetSpectrumPhy();
+        Ptr<BeamManager> beamManager = specPhy->GetBeamManager();
+
+        if (!beamManager)
+        {
+            NS_LOG_WARN("  gNB[" << gnbIdx << "] no BeamManager found");
+            continue;
+        }
+
+        for (uint32_t u = 0; u < g_numUE; ++u)
+        {
+            Ptr<NrUeNetDevice> ueDev = ueDevs.Get(u)->GetObject<NrUeNetDevice>();
+            Ptr<const NrGnbNetDevice> targetGnb = ueDev->GetTargetGnb();
+            Ptr<NrGnbNetDevice> gnbDev = gnbDevs.Get(gnbIdx)->GetObject<NrGnbNetDevice>();
+            if (targetGnb == gnbDev)
+            {
+                BeamformingVector retBfvPair = {retBfv, BeamId(static_cast<uint16_t>(gnbIdx), static_cast<uint16_t>(tiltDeg))};
+                beamManager->SaveBeamformingVector(retBfvPair, ueDev);
+                NS_LOG_INFO("  gNB[" << gnbIdx << "] overwrote UE[" << u << "] beam -> RET "
+                            << "bearing=" << bearingDeg << "deg, tilt=" << tiltDeg << "deg");
+            }
+        }
+
+        g_gnbAntennas[gnbIdx]->SetBeamformingVector(retBfv);
+    }
+    NS_LOG_INFO("=== RET beam overwrite complete ===");
 
     // Remote host + routing
     NodeContainer remoteHostContainer;
