@@ -254,23 +254,24 @@ void SampleMetrics()
 }
         
                    
-// ── RET actuator — true electrical tilt via beamforming vector ───────────────
+// ── RET actuator — electrical downtilt via 3GPP TR 38.901 rotation ───────────
+// Sets the UPA downtilt angle (beta), which rotates the element pattern
+// evaluation and element positions per eq. 7.1-4 / 7.1-7 / 7.1-8.
+// Per-UE beamforming (DirectPathBeamforming) continues to work on top
+// of the tilted pattern — this is how real-world RET operates.
 void ApplyRet(uint32_t gnbIdx, double newTiltDeg)
 {
     NS_ASSERT_MSG(g_gnbAntennas[gnbIdx], "Null UPA handle for gNB " << gnbIdx);
 
-    const double bearingDeg = BEARING_DEG[gnbIdx];
-    const double zenithDeg  = 90.0 - newTiltDeg;
-
     NS_LOG_INFO("[RET] t=" << Simulator::Now().GetSeconds()
                 << "s  gNB[" << gnbIdx << "]"
                 << "  elec_tilt=" << newTiltDeg << "deg"
-                << "  bearing="   << bearingDeg  << "deg"
-                << "  (zenith="   << zenithDeg   << "deg)");
+                << "  bearing="   << BEARING_DEG[gnbIdx] << "deg");
 
-    PhasedArrayModel::ComplexVector bfv =
-        CreateDirectionalBfvAz(g_gnbAntennas[gnbIdx], bearingDeg, zenithDeg);
-    g_gnbAntennas[gnbIdx]->SetBeamformingVector(bfv);
+    // SetBeta() applies downtilt by rotating the array's local coordinate
+    // system. It also calls InvalidateChannels(), triggering channel matrix
+    // recomputation with the new tilt on the next beamforming update.
+    g_gnbAntennas[gnbIdx]->SetBeta(DegreesToRadians(newTiltDeg));
     g_currentTiltDeg[gnbIdx] = newTiltDeg;
 }
 // ── Harvest UPA handles + set mechanical bearing ──────────────────────────────
@@ -286,15 +287,17 @@ void HarvestAntennaHandles(const NetDeviceContainer& gnbDevs,
 
         NS_ABORT_MSG_IF(!upa, "UniformPlanarArray null for gNB " << i);
 
-        // Set mechanical bearing via SetAlpha() — bypasses the [-π,π] checker
-        // which rejects exactly 180° (= π rad) at the boundary.
-        // Mechanical tilt stays at 0; all tilt is done electrically.
+        // Set array orientation: bearing (alpha) and downtilt (beta)
+        // per 3GPP TR 38.901 eq. 7.1-4 rotation matrix.
+        // Setting beta HERE (before attach) ensures the initial
+        // DirectPathBeamforming computation already accounts for the tilt.
         upa->SetAlpha(DegreesToRadians(BEARING_DEG[i]));
-        upa->SetBeta(0.0);
+        upa->SetBeta(DegreesToRadians(g_currentTiltDeg[i]));
 
         g_gnbAntennas[i] = upa;
         NS_LOG_INFO("[INIT] gNB[" << i << "] UPA acquired"
-                    << "  mech_bearing=" << BEARING_DEG[i] << "deg");
+                    << "  bearing=" << BEARING_DEG[i] << "deg"
+                    << "  downtilt=" << g_currentTiltDeg[i] << "deg");
     }
 
 
@@ -587,11 +590,11 @@ int main(int argc, char* argv[])
     nrHelper->SetEpcHelper(epcHelper);
 
     Ptr<IdealBeamformingHelper> bfHelper = CreateObject<IdealBeamformingHelper>();
-    // IMPORTANT: Set periodicity BEFORE SetBeamformingHelper (which calls Initialize(),
-    // scheduling the timer). If we set it after, the default 100ms timer fires at t=100ms
-    // and re-runs beamforming, overwriting our RET vectors with optimal per-UE vectors.
+    // Periodic beamforming re-optimises per-UE beams within the tilted
+    // antenna pattern.  500 ms is a reasonable interval for static UEs;
+    // reduce if UEs become mobile or tilts change dynamically.
     bfHelper->SetAttribute("BeamformingPeriodicity",
-                           TimeValue(Seconds(g_simDuration + 1000.0)));
+                           TimeValue(MilliSeconds(500)));
     bfHelper->SetAttribute("BeamformingMethod",
                            TypeIdValue(DirectPathBeamforming::GetTypeId()));
     nrHelper->SetBeamformingHelper(bfHelper);
@@ -689,46 +692,10 @@ int main(int argc, char* argv[])
     g_uePositions.close();
     NS_LOG_INFO("[INIT] UE positions written to " << g_uePositionsFileName);
 
-    // ── Overwrite per-UE beams with fixed RET beam ─────────────────────────────
-    // The beamforming helper computed per-UE optimal beams during attach.
-    // We replace them all with the fixed RET beam so the tilt takes effect.
-    NS_LOG_INFO("=== Overwriting per-UE beams with fixed RET beam ===");
-    for (uint32_t gnbIdx = 0; gnbIdx < NUM_GNB; ++gnbIdx)
-    {
-        double bearingDeg  = BEARING_DEG[gnbIdx];
-        double tiltDeg     = g_currentTiltDeg[gnbIdx];
-        double zenithDeg   = 90.0 - tiltDeg;
-
-        PhasedArrayModel::ComplexVector retBfv =
-            CreateDirectionalBfvAz(g_gnbAntennas[gnbIdx], bearingDeg, zenithDeg);
-
-        Ptr<NrGnbPhy> phy = nrHelper->GetGnbPhy(gnbDevs.Get(gnbIdx), 0);
-        Ptr<NrSpectrumPhy> specPhy = phy->GetSpectrumPhy();
-        Ptr<BeamManager> beamManager = specPhy->GetBeamManager();
-
-        if (!beamManager)
-        {
-            NS_LOG_WARN("  gNB[" << gnbIdx << "] no BeamManager found");
-            continue;
-        }
-
-        for (uint32_t u = 0; u < g_numUE; ++u)
-        {
-            Ptr<NrUeNetDevice> ueDev = ueDevs.Get(u)->GetObject<NrUeNetDevice>();
-            Ptr<const NrGnbNetDevice> targetGnb = ueDev->GetTargetGnb();
-            Ptr<NrGnbNetDevice> gnbDev = gnbDevs.Get(gnbIdx)->GetObject<NrGnbNetDevice>();
-            if (targetGnb == gnbDev)
-            {
-                BeamformingVector retBfvPair = {retBfv, BeamId(static_cast<uint16_t>(gnbIdx), static_cast<uint16_t>(tiltDeg))};
-                beamManager->SaveBeamformingVector(retBfvPair, ueDev);
-                NS_LOG_INFO("  gNB[" << gnbIdx << "] overwrote UE[" << u << "] beam -> RET "
-                            << "bearing=" << bearingDeg << "deg, tilt=" << tiltDeg << "deg");
-            }
-        }
-
-        g_gnbAntennas[gnbIdx]->SetBeamformingVector(retBfv);
-    }
-    NS_LOG_INFO("=== RET beam overwrite complete ===");
+    // ── RET is applied via SetBeta() in HarvestAntennaHandles (before attach) ──
+    // DirectPathBeamforming already computed per-UE optimal beams within the
+    // tilted antenna pattern during AttachToClosestGnb.  No manual beam
+    // overwrite is needed — per-UE beamforming is preserved.
 
     // ── Remote host + routing ──────────────────────────────────────────────────
     NodeContainer remoteHostContainer;
@@ -802,18 +769,17 @@ int main(int argc, char* argv[])
             MakeBoundCallback(&RsrpCallback, u));
     }
 
-    // ── Apply static electrical tilt at t=1ms (after BF run at t=0) ─────────
-    NS_LOG_INFO("=== Static Electrical Tilt ===");
-    const std::array<double, NUM_GNB> tilts = {g_gnb0TiltDeg, g_gnb1TiltDeg, g_gnb2TiltDeg};
+    // ── Static tilt already applied via SetBeta() before attach ─────────────
+    NS_LOG_INFO("=== Static Electrical Tilt (applied before attach via SetBeta) ===");
     for (uint32_t i = 0; i < NUM_GNB; ++i)
     {
-        Simulator::Schedule(MilliSeconds(1), &ApplyRet, i, tilts[i]);
         NS_LOG_INFO("  gNB[" << i << "]"
-                    << "  bearing="    << BEARING_DEG[i]      << "deg"
-                    << "  elec_tilt="  << tilts[i]            << "deg");
+                    << "  bearing="    << BEARING_DEG[i]         << "deg"
+                    << "  elec_tilt="  << g_currentTiltDeg[i]    << "deg");
     }
     NS_LOG_INFO("  All gNBs configured with static tilts: [" 
-                << tilts[0] << ", " << tilts[1] << ", " << tilts[2] << "] degrees");
+                << g_currentTiltDeg[0] << ", " << g_currentTiltDeg[1] << ", "
+                << g_currentTiltDeg[2] << "] degrees");
     
     // ── Start metric sampling at t=2.5s Staggered Traffic times ────────────
     Simulator::Schedule(Seconds(2.5), &SampleMetrics);
